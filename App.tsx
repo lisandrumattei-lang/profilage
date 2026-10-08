@@ -1,16 +1,20 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, AppState, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, AppState, Image, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import Svg, { Circle } from 'react-native-svg';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Action, dateKey, effort, emptyDay, initialJournal, Journal, numberInput, parseJournal, PRESETS, progress, reduceJournal, totals } from './src/model';
+import { FoodProduct, portionNutrients } from './src/food';
+import { NutritionBrowser } from './src/NutritionBrowser';
+import { GarminImport } from './src/GarminImport';
+import { pickMealPhoto, removeMealPhoto } from './src/photos';
 
 const C = { bg: '#0B1118', card: '#141D27', line: '#26323E', text: '#F2F5F6', muted: '#96A7B8', green: '#B2F481', blue: '#8DB9FF', orange: '#FFBD7A', red: '#FF9E9E' };
 const STORAGE = 'profilage.journal.v1';
 type Tab = 'today' | 'activity' | 'nutrition';
-type Sheet = 'meal' | 'workout' | 'recovery' | 'goals' | 'clear' | null;
+type Sheet = 'meal' | 'food' | 'garmin' | 'workout' | 'recovery' | 'goals' | 'clear' | null;
 type IconName = React.ComponentProps<typeof Ionicons>['name'];
 const fmt = (n: number) => Math.round(n).toLocaleString('fr-FR');
 const uid = () => `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -43,7 +47,7 @@ function Empty({ icon, title, text }: { icon: IconName; title: string; text: str
   return <View style={s.empty}><Icon name={icon} color={C.blue} size={32} /><Text style={s.emptyTitle}>{title}</Text><Text style={s.body}>{text}</Text></View>;
 }
 function Field({ label, value, onChange, numeric = false, placeholder }: { label: string; value: string; onChange: (text: string) => void; numeric?: boolean; placeholder?: string }) {
-  return <View style={s.field}><Text style={s.fieldLabel}>{label}</Text><TextInput accessibilityLabel={label} value={value} onChangeText={onChange} placeholder={placeholder} placeholderTextColor={C.muted} keyboardType={numeric ? 'decimal-pad' : 'default'} maxLength={numeric ? 8 : 80} style={s.input} /></View>;
+  return <View style={s.field}><Text style={s.fieldLabel}>{label}</Text><TextInput accessibilityLabel={label} value={value} onChangeText={onChange} placeholder={placeholder} placeholderTextColor={C.muted} keyboardType={numeric ? 'decimal-pad' : 'default'} maxLength={numeric ? 8 : 200} style={s.input} /></View>;
 }
 
 export default function App() { return <SafeAreaProvider><JournalApp /></SafeAreaProvider>; }
@@ -58,6 +62,13 @@ function JournalApp() {
   const [sheet, setSheet] = useState<Sheet>(null);
   const [form, setForm] = useState<Record<string, string>>({});
   const [error, setError] = useState('');
+  const [selectedProduct, setSelectedProduct] = useState<FoodProduct | null>(null);
+  const [scanInitially, setScanInitially] = useState(false);
+  const [photoBusy, setPhotoBusy] = useState(false);
+  const photoJob = useRef(0);
+  const draftPhoto = useRef<string | undefined>(undefined);
+  const photosToDelete = useRef(new Set<string>());
+  const latestJournal = useRef(journal); latestJournal.current = journal;
   const saveQueue = useRef<Promise<void>>(Promise.resolve());
   const formDate = useRef(selectedDate);
   const day = journal.days[selectedDate] ?? emptyDay();
@@ -80,7 +91,12 @@ function JournalApp() {
   useEffect(() => {
     if (!loaded || storageBlocked) return;
     const raw = JSON.stringify(journal);
-    saveQueue.current = saveQueue.current.then(() => AsyncStorage.setItem(STORAGE, raw)).then(() => setStorageError('')).catch(() => setStorageError('La sauvegarde a échoué. Vos dernières saisies sont uniquement en mémoire.'));
+    const discarded = [...photosToDelete.current]; photosToDelete.current.clear();
+    saveQueue.current = saveQueue.current.then(() => AsyncStorage.setItem(STORAGE, raw)).then(() => {
+      setStorageError('');
+      const retained = new Set(Object.values(latestJournal.current.days).flatMap(d => d.meals.map(m => m.photoUri)));
+      discarded.forEach(uri => { if (!retained.has(uri)) removeMealPhoto(uri); });
+    }).catch(() => { discarded.forEach(uri => photosToDelete.current.add(uri)); setStorageError('La sauvegarde a échoué. Vos dernières saisies sont uniquement en mémoire.'); });
   }, [journal, loaded, storageBlocked]);
   useEffect(() => {
     const refresh = () => {
@@ -93,25 +109,69 @@ function JournalApp() {
   }, []);
   const dispatch = (action: Action) => {
     if (storageBlocked && action.type !== 'clear') return;
-    if (action.type === 'clear') { setStorageBlocked(false); setStorageError(''); }
+    if (action.type === 'clear') {
+      Object.values(journal.days).forEach(d => d.meals.forEach(meal => { if (meal.photoUri) photosToDelete.current.add(meal.photoUri); }));
+      setStorageBlocked(false); setStorageError('');
+    }
+    if (action.type === 'removeMeal') {
+      const uri = journal.days[action.date]?.meals.find(meal => meal.id === action.id)?.photoUri;
+      if (uri) photosToDelete.current.add(uri);
+    }
     setJournal(current => reduceJournal(current, action));
   };
+  function discardPhotoDraft() {
+    photoJob.current++; setPhotoBusy(false);
+    removeMealPhoto(draftPhoto.current); draftPhoto.current = undefined;
+  }
+  function closeSheet() { discardPhotoDraft(); setSheet(null); setSelectedProduct(null); }
   function open(target: Sheet) {
     formDate.current = selectedDate;
     setError('');
-    if (target === 'meal') setForm({ name: '', calories: '', protein: '', carbs: '', fat: '' });
+    if (target === 'meal' || (target === 'food' && sheet !== 'meal')) {
+      discardPhotoDraft(); setSelectedProduct(null);
+      setForm({ name: '', calories: '', protein: '', carbs: '', fat: '' });
+    }
     if (target === 'workout') setForm({ name: 'Course à pied', minutes: '30', intensity: '5' });
     if (target === 'recovery') setForm({ sleep: String(day.sleep || 8).replace('.', ','), energy: String(day.energy || 3) });
     if (target === 'goals') setForm(Object.fromEntries(Object.entries(goals).map(([key, value]) => [key, String(value).replace('.', ',')])));
     setSheet(target);
   }
+  function openFood(scan = false) { setScanInitially(scan); open('food'); }
+  function chooseFood(product: FoodProduct) {
+    setSelectedProduct(product); setError('');
+    const nutrients = portionNutrients(product, 100);
+    setForm(current => ({ ...current, name: product.name, portion: '100', ...Object.fromEntries(Object.entries(nutrients).map(([key, value]) => [key, value === null ? '' : String(value).replace('.', ',')])) }));
+    setSheet('meal');
+  }
+  function changePortion(portion: string) {
+    setForm(current => {
+      const quantity = numberInput(portion, 1, 5000);
+      if (!selectedProduct || quantity === null) return { ...current, portion };
+      return { ...current, portion, ...Object.fromEntries(Object.entries(portionNutrients(selectedProduct, quantity)).map(([key, value]) => [key, value === null ? '' : String(value).replace('.', ',')])) };
+    });
+  }
+  async function addPhoto(camera: boolean) {
+    const job = ++photoJob.current; setPhotoBusy(true); setError('');
+    try {
+      const uri = await pickMealPhoto(camera);
+      if (job !== photoJob.current) { if (uri) removeMealPhoto(uri); return; }
+      if (uri) {
+        removeMealPhoto(draftPhoto.current); draftPhoto.current = uri;
+        setForm(current => ({ ...current, photoUri: uri }));
+      }
+    } catch (photoError) { if (job === photoJob.current) setError(photoError instanceof Error ? photoError.message : 'Impossible de récupérer cette photo.'); }
+    finally { if (job === photoJob.current) setPhotoBusy(false); }
+  }
   function saveForm() {
     if (storageBlocked && sheet !== 'clear') { setError('La sauvegarde doit être rétablie avant toute saisie.'); return; }
     const numeric = (key: string, min: number, max: number) => numberInput(form[key] ?? '', min, max);
     if (sheet === 'meal') {
-      const calories = numeric('calories', 1, 10000), protein = numeric('protein', 0, 1000), carbs = numeric('carbs', 0, 1000), fat = numeric('fat', 0, 1000);
-      if (!form.name?.trim() || calories === null || protein === null || carbs === null || fat === null) { setError('Ajoutez un nom, 1 à 10 000 kcal et des macros entre 0 et 1 000 g.'); return; }
-      dispatch({ type: 'meal', date: formDate.current, meal: { id: uid(), name: form.name.trim(), calories, protein, carbs, fat } });
+      const calories = numeric('calories', 0, 10000), protein = numeric('protein', 0, 1000), carbs = numeric('carbs', 0, 1000), fat = numeric('fat', 0, 1000);
+      const portion = selectedProduct ? numeric('portion', 1, 5000) : null;
+      if (photoBusy) { setError('Attendez la fin du traitement de la photo.'); return; }
+      if (!form.name?.trim() || calories === null || protein === null || carbs === null || fat === null || (selectedProduct && portion === null)) { setError('Ajoutez un nom, 0 à 10 000 kcal et des macros entre 0 et 1 000 g. Pour un aliment recherché, renseignez aussi la quantité (1–5 000 g/ml).'); return; }
+      dispatch({ type: 'meal', date: formDate.current, meal: { id: uid(), name: form.name.trim(), calories, protein, carbs, fat, ...(form.photoUri ? { photoUri: form.photoUri } : {}), ...(selectedProduct && portion !== null ? { ...(selectedProduct.barcode ? { barcode: selectedProduct.barcode } : {}), ...(selectedProduct.ciqualCode ? { ciqualCode: selectedProduct.ciqualCode } : {}), portion, foodSource: selectedProduct.source } : {}) } });
+      draftPhoto.current = undefined;
     } else if (sheet === 'workout') {
       const minutes = numeric('minutes', 1, 600), intensity = numeric('intensity', 1, 10);
       if (!form.name?.trim() || minutes === null || intensity === null) { setError('Ajoutez un nom, une durée de 1 à 600 min et un effort de 1 à 10.'); return; }
@@ -125,7 +185,7 @@ function JournalApp() {
       if (calories === null || protein === null || water === null || sleep === null) { setError('Objectifs acceptés : 500–10 000 kcal, 10–500 g de protéines, 250–10 000 ml d’eau, 1–16 h de sommeil.'); return; }
       dispatch({ type: 'goals', goals: { calories, protein, water, sleep } });
     } else if (sheet === 'clear') { dispatch({ type: 'clear' }); }
-    setSheet(null);
+    closeSheet();
   }
   function shiftDate(delta: number) {
     const d = new Date(`${selectedDate}T12:00:00`); d.setDate(d.getDate() + delta);
@@ -133,7 +193,7 @@ function JournalApp() {
   }
   const dateLabel = new Date(`${selectedDate}T12:00:00`).toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' });
   const titles: Record<Tab, string> = { today: 'Votre équilibre.', activity: 'Chaque mouvement compte.', nutrition: 'Bien manger. Mieux vivre.' };
-  const sheetTitles: Record<Exclude<Sheet, null>, string> = { meal: 'Ajouter un repas', workout: 'Enregistrer une activité', recovery: 'Comment vous sentez-vous ?', goals: 'Vos objectifs', clear: 'Repartir de zéro ?' };
+  const sheetTitles: Record<Exclude<Sheet, null>, string> = { meal: 'Ajouter un repas', food: 'Trouver un aliment', garmin: 'Vos activités Garmin', workout: 'Enregistrer une activité', recovery: 'Comment vous sentez-vous ?', goals: 'Vos objectifs', clear: 'Repartir de zéro ?' };
 
   if (!loaded) return <SafeAreaView style={s.screen}><StatusBar style="light" /><View style={s.loading}><ActivityIndicator color={C.green} /><Text style={s.body}>Votre journal se prépare…</Text></View></SafeAreaView>;
   return <SafeAreaView style={s.screen} edges={['top', 'left', 'right']}><StatusBar style="light" />
@@ -169,16 +229,18 @@ function JournalApp() {
         {tab === 'activity' && <>
           <View style={s.card}><View style={s.row}><View style={s.flex}><Text style={s.overline}>TEMPS ACTIF</Text><Text style={s.bigMetric}>{day.workouts.reduce((n, w) => n + w.minutes, 0)}<Text style={s.unit}> min</Text></Text><Text style={s.small}>{day.workouts.length} séance{day.workouts.length > 1 ? 's' : ''} · {isToday ? 'aujourd’hui' : 'ce jour'}</Text></View><View style={[s.activityGlyph, { backgroundColor: '#302A24' }]}><Icon name="fitness-outline" size={42} color={C.orange} /></View></View><View style={s.divider} /><View style={s.row}><Text style={s.body}>Charge déclarée</Text><Text style={[s.cardTitle, { color: C.orange }]}>{fmt(effort(day))} unités</Text></View><Text style={s.small}>Durée × effort perçu (1–10). Sans mesure de capteur.</Text></View>
           <Button title="Enregistrer une activité" icon="add" onPress={() => open('workout')} disabled={storageBlocked} />
+          <Button title="Importer depuis Garmin" icon="watch-outline" secondary onPress={() => open('garmin')} disabled={storageBlocked} />
           <Section title="Vos séances" />
-          {day.workouts.length === 0 ? <Empty icon="walk-outline" title="À votre rythme" text="Une marche, une course ou une séance de yoga : chaque mouvement a sa place ici." /> : day.workouts.map(workout => <View key={workout.id} style={s.card}><View style={s.row}><View style={[s.tileIcon, { backgroundColor: '#302A24' }]}><Icon name="barbell-outline" color={C.orange} /></View><View style={s.flex}><Text style={s.cardTitle}>{workout.name}</Text><Text style={s.small}>{workout.minutes} min · Effort {workout.intensity}/10</Text></View><Pressable accessibilityRole="button" accessibilityLabel={`Supprimer l’activité ${workout.name}`} onPress={() => dispatch({ type: 'removeWorkout', date: selectedDate, id: workout.id })} hitSlop={10}><Icon name="trash-outline" size={18} /></Pressable></View><Bar value={workout.intensity} goal={10} color={C.orange} /></View>)}
+          {day.workouts.length === 0 ? <Empty icon="walk-outline" title="À votre rythme" text="Une marche, une course ou une séance de yoga : chaque mouvement a sa place ici." /> : day.workouts.map(workout => <View key={workout.id} style={s.card}><View style={s.row}><View style={[s.tileIcon, { backgroundColor: '#302A24' }]}><Icon name="barbell-outline" color={C.orange} /></View><View style={s.flex}><Text style={s.cardTitle}>{workout.name}</Text><Text style={s.small}>{workout.minutes} min · Effort {workout.intensity}/10</Text>{workout.source === 'garmin-tcx' && <Text style={[s.small, { color: C.blue }]}>Import Garmin{workout.distanceKm !== undefined ? ` · ${workout.distanceKm} km` : ''}</Text>}</View><Pressable accessibilityRole="button" accessibilityLabel={`Supprimer l’activité ${workout.name}`} onPress={() => dispatch({ type: 'removeWorkout', date: selectedDate, id: workout.id })} hitSlop={10}><Icon name="trash-outline" size={18} /></Pressable></View><Bar value={workout.intensity} goal={10} color={C.orange} /></View>)}
           <View style={s.note}><Icon name="information-circle-outline" color={C.orange} /><Text style={[s.body, s.flex]}>L’effort perçu est votre propre évaluation : 1 pour très facile, 10 pour maximal. Ce journal ne mesure ni la fréquence cardiaque ni les calories dépensées.</Text></View>
         </>}
 
         {tab === 'nutrition' && <>
           <View style={s.card}><View style={s.row}><View style={s.flex}><Text style={s.overline}>VOTRE APPORT DU JOUR</Text><Text style={s.bigMetric}>{fmt(sum.calories)}<Text style={s.unit}> kcal</Text></Text><Text style={s.small}>Objectif personnel · {fmt(goals.calories)} kcal</Text></View><Ring value={sum.calories} goal={goals.calories} label={`${Math.round(sum.calories / goals.calories * 100)}%`} caption="OBJECTIF" size={100} /></View><Bar value={sum.calories} goal={goals.calories} /><Text style={s.body}>{sum.calories <= goals.calories ? `${fmt(goals.calories - sum.calories)} kcal jusqu’à votre objectif` : `${fmt(sum.calories - goals.calories)} kcal au-dessus de votre objectif`}</Text><View style={s.macros}>{[{ name: 'Protéines', value: sum.protein, color: C.green }, { name: 'Glucides', value: sum.carbs, color: C.blue }, { name: 'Lipides', value: sum.fat, color: C.orange }].map(macro => <View key={macro.name} style={s.macro}><View style={[s.macroDot, { backgroundColor: macro.color }]} /><Text style={s.cardTitle}>{fmt(macro.value)} g</Text><Text style={s.small}>{macro.name}</Text></View>)}</View><Text style={s.small}>Protéines : {fmt(sum.protein)} / {fmt(goals.protein)} g</Text></View>
           <Button title="Ajouter un repas" icon="add" onPress={() => open('meal')} disabled={storageBlocked} />
+          <View style={s.duo}><View style={s.flex}><Button title="Rechercher" icon="search" secondary onPress={() => openFood(false)} disabled={storageBlocked} /></View><View style={s.flex}><Button title="Code-barres" icon="barcode-outline" secondary onPress={() => openFood(true)} disabled={storageBlocked} /></View></View>
           <Section title="Votre journal alimentaire" />
-          {day.meals.length === 0 ? <Empty icon="restaurant-outline" title="Une page à remplir" text="Ajoutez votre premier repas et retrouvez vos apports au fil de la journée." /> : day.meals.map(meal => <View key={meal.id} style={s.card}><View style={s.row}><View style={[s.tileIcon, { backgroundColor: '#273525' }]}><Icon name="leaf-outline" color={C.green} /></View><View style={s.flex}><Text style={s.cardTitle}>{meal.name}</Text><Text style={s.small}>P {fmt(meal.protein)} · G {fmt(meal.carbs)} · L {fmt(meal.fat)} g</Text></View><Text style={s.mealKcal}>{fmt(meal.calories)}<Text style={s.small}> kcal</Text></Text><Pressable accessibilityRole="button" accessibilityLabel={`Supprimer le repas ${meal.name}`} onPress={() => dispatch({ type: 'removeMeal', date: selectedDate, id: meal.id })} hitSlop={10}><Icon name="close" size={20} /></Pressable></View></View>)}
+          {day.meals.length === 0 ? <Empty icon="restaurant-outline" title="Une page à remplir" text="Ajoutez votre premier repas et retrouvez vos apports au fil de la journée." /> : day.meals.map(meal => <View key={meal.id} style={s.card}><View style={s.row}><View style={[s.tileIcon, { backgroundColor: '#273525' }]}><Icon name="leaf-outline" color={C.green} /></View><View style={s.flex}><Text style={s.cardTitle}>{meal.name}</Text><Text style={s.small}>P {fmt(meal.protein)} · G {fmt(meal.carbs)} · L {fmt(meal.fat)} g</Text>{meal.foodSource && <Text style={[s.small, { color: C.green }]}>{meal.foodSource === 'ciqual' ? 'Anses Ciqual' : 'Open Food Facts'} · {meal.portion} {meal.foodSource === 'ciqual' ? 'g' : 'g/ml'}</Text>}</View><Text style={s.mealKcal}>{fmt(meal.calories)}<Text style={s.small}> kcal</Text></Text><Pressable accessibilityRole="button" accessibilityLabel={`Supprimer le repas ${meal.name}`} onPress={() => dispatch({ type: 'removeMeal', date: selectedDate, id: meal.id })} hitSlop={10}><Icon name="close" size={20} /></Pressable></View>{meal.photoUri && <Image accessibilityLabel={`Photo du repas ${meal.name}`} source={{ uri: meal.photoUri }} style={s.mealPhoto} resizeMode="cover" />}</View>)}
           <Section title="Hydratation" /><View style={s.card}><View style={s.row}><Icon name="water-outline" color={C.blue} size={28} /><Text style={[s.metric, s.flex]}>{fmt(day.water)}<Text style={s.unit}> ml</Text></Text><Text style={s.small}>/ {fmt(goals.water)} ml</Text></View><Bar value={day.water} goal={goals.water} color={C.blue} /><View style={s.row}><View style={s.flex}><Button title="− 250 ml" secondary disabled={storageBlocked || day.water === 0} onPress={() => dispatch({ type: 'water', date: selectedDate, delta: -250 })} /></View><View style={s.flex}><Button title="+ 250 ml" secondary disabled={storageBlocked || day.water === 10000} onPress={() => dispatch({ type: 'water', date: selectedDate, delta: 250 })} /></View></View></View>
         </>}
         <Text style={s.footer}>VOTRE JOURNAL. VOTRE RYTHME.</Text>
@@ -186,16 +248,34 @@ function JournalApp() {
       <SafeAreaView edges={['bottom']} style={s.nav}><View style={s.navRow}>{([{ key: 'today', label: 'Aujourd’hui', icon: 'grid-outline' }, { key: 'activity', label: 'Activité', icon: 'pulse-outline' }, { key: 'nutrition', label: 'Nutrition', icon: 'restaurant-outline' }] as { key: Tab; label: string; icon: IconName }[]).map(item => <Pressable key={item.key} accessibilityRole="tab" accessibilityLabel={item.label} accessibilityState={{ selected: tab === item.key }} onPress={() => setTab(item.key)} style={s.navItem}><View style={[s.navIcon, tab === item.key && { backgroundColor: '#253726' }]}><Icon name={item.icon} color={tab === item.key ? C.green : C.muted} size={22} /></View><Text style={[s.navLabel, tab === item.key && { color: C.green }]}>{item.label}</Text></Pressable>)}</View></SafeAreaView>
     </View>
 
-    <Modal visible={sheet !== null} transparent animationType="slide" onRequestClose={() => setSheet(null)}>
-      <KeyboardAvoidingView style={s.modalBackdrop} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}><Pressable accessibilityRole="button" accessibilityLabel="Fermer le formulaire" style={StyleSheet.absoluteFill} onPress={() => setSheet(null)} /><SafeAreaView style={s.sheet} edges={['bottom']}><View style={s.sheetHandle} /><View style={s.sheetHeading}><Text style={s.sheetTitle}>{sheet ? sheetTitles[sheet] : ''}</Text><Pressable accessibilityRole="button" accessibilityLabel="Fermer" onPress={() => setSheet(null)} style={s.iconButton}><Icon name="close" color={C.text} /></Pressable></View>
+    <Modal visible={sheet !== null} transparent animationType="slide" onRequestClose={closeSheet}>
+      <KeyboardAvoidingView style={s.modalBackdrop} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}><Pressable accessibilityRole="button" accessibilityLabel="Fermer le formulaire" style={StyleSheet.absoluteFill} onPress={closeSheet} /><SafeAreaView style={s.sheet} edges={['bottom']}><View style={s.sheetHandle} /><View style={s.sheetHeading}><Text style={s.sheetTitle}>{sheet ? sheetTitles[sheet] : ''}</Text><Pressable accessibilityRole="button" accessibilityLabel="Fermer" onPress={closeSheet} style={s.iconButton}><Icon name="close" color={C.text} /></Pressable></View>
         <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={s.sheetContent}>
-          {sheet === 'meal' && <><Text style={s.body}>Renseignez les valeurs de votre repas ou partez d’un exemple à ajuster.</Text><View style={s.presetRow}>{PRESETS.map(preset => <Pressable accessibilityRole="button" key={preset.name} onPress={() => setForm(Object.fromEntries(Object.entries(preset).map(([key, value]) => [key, String(value)])))} style={s.chip}><Text style={s.chipText}>{preset.name}</Text></Pressable>)}</View><Field label="Nom du repas" value={form.name ?? ''} onChange={name => setForm(current => ({ ...current, name }))} placeholder="Ex. Déjeuner" />{[{ key: 'calories', label: 'Énergie (kcal)' }, { key: 'protein', label: 'Protéines (g)' }, { key: 'carbs', label: 'Glucides (g)' }, { key: 'fat', label: 'Lipides (g)' }].map(field => <Field key={field.key} label={field.label} numeric value={form[field.key] ?? ''} onChange={value => setForm(current => ({ ...current, [field.key]: value }))} />)}<Text style={s.small}>Les exemples sont des estimations, sans base alimentaire connectée.</Text></>}
+          {sheet === 'food' && <><NutritionBrowser startWithScan={scanInitially} onPick={chooseFood} /><Button title="Saisir un repas manuellement" secondary onPress={() => setSheet('meal')} /></>}
+          {sheet === 'garmin' && <GarminImport exists={id => Object.values(journal.days).some(d => d.workouts.some(w => w.id === id))} onImport={(date, workout) => {
+            if (storageBlocked) { setError('Rétablissez la sauvegarde avant de saisir des données.'); return; }
+            if (date > today) { setError('L’activité est datée dans le futur. Vérifiez la date du fichier Garmin.'); return; }
+            dispatch({ type: 'workout', date, workout }); setSelectedDate(date); setTab('activity'); closeSheet();
+          }} />}
+          {sheet === 'meal' && <>
+            <Button title="Chercher un aliment ou scanner" icon="barcode-outline" secondary disabled={photoBusy} onPress={() => openFood(false)} />
+            <Text style={s.body}>Saisissez votre repas, choisissez un exemple, ou utilisez la base alimentaire.</Text>
+            <View style={s.presetRow}>{PRESETS.map(preset => <Pressable accessibilityRole="button" key={preset.name} onPress={() => { setSelectedProduct(null); setForm(current => ({ ...Object.fromEntries(Object.entries(preset).map(([key, value]) => [key, String(value)])), ...(current.photoUri ? { photoUri: current.photoUri } : {}) })); }} style={s.chip}><Text style={s.chipText}>{preset.name}</Text></Pressable>)}</View>
+            <Field label="Nom du repas" value={form.name ?? ''} onChange={name => setForm(current => ({ ...current, name }))} placeholder="Ex. Déjeuner" />
+            {selectedProduct && <><View style={s.card}><Text style={s.cardTitle}>{selectedProduct.brand || 'Produit Open Food Facts'}</Text><Text style={s.small}>Source : {selectedProduct.source === 'ciqual' ? 'Anses Ciqual 2025' : 'Open Food Facts'} · {selectedProduct.barcode ?? selectedProduct.ciqualCode}</Text><Text style={s.small}>Valeurs pour 100 g / ml selon l’étiquette. Adaptez la quantité ; les apports ci-dessous se recalculent.</Text></View><Field label="Quantité consommée (g ou ml)" numeric value={form.portion ?? '100'} onChange={changePortion} /></>}
+            {[{ key: 'calories', label: 'Énergie (kcal)' }, { key: 'protein', label: 'Protéines (g)' }, { key: 'carbs', label: 'Glucides (g)' }, { key: 'fat', label: 'Lipides (g)' }].map(field => <Field key={field.key} label={field.label} numeric value={form[field.key] ?? ''} onChange={value => setForm(current => ({ ...current, [field.key]: value }))} />)}
+            <Section title="Photo de votre plat" />
+            <View style={s.duo}><View style={s.flex}><Button title="Prendre une photo" icon="camera-outline" secondary disabled={photoBusy} onPress={() => void addPhoto(true)} /></View><View style={s.flex}><Button title="Photothèque" icon="images-outline" secondary disabled={photoBusy} onPress={() => void addPhoto(false)} /></View></View>
+            {photoBusy && <ActivityIndicator color={C.green} />}
+            {!!form.photoUri && <><Image accessibilityLabel="Photo du repas à enregistrer" source={{ uri: form.photoUri }} style={s.mealPhoto} resizeMode="cover" /><Button title="Retirer la photo" secondary onPress={() => { discardPhotoDraft(); setForm(current => ({ ...current, photoUri: '' })); }} /></>}
+            <Text style={s.small}>La photo reste sur votre appareil. Les calories et quantités sont à renseigner ; aucune analyse automatique de la photo. Les exemples sont des estimations.</Text>
+          </>}
           {sheet === 'workout' && <><View style={s.presetRow}>{['Course à pied', 'Musculation', 'Vélo', 'Marche', 'Yoga'].map(name => <Pressable accessibilityRole="button" key={name} onPress={() => setForm(current => ({ ...current, name }))} style={[s.chip, form.name === name && s.selectedChip]}><Text style={[s.chipText, form.name === name && { color: C.green }]}>{name}</Text></Pressable>)}</View><Field label="Activité" value={form.name ?? ''} onChange={name => setForm(current => ({ ...current, name }))} /><Field label="Durée (minutes)" numeric value={form.minutes ?? ''} onChange={minutes => setForm(current => ({ ...current, minutes }))} /><Text style={s.fieldLabel}>Effort perçu · {form.intensity}/10</Text><View style={s.effortRow}>{Array.from({ length: 10 }, (_, i) => i + 1).map(value => <Pressable accessibilityRole="button" accessibilityLabel={`Effort ${value} sur 10`} accessibilityState={{ selected: form.intensity === String(value) }} key={value} onPress={() => setForm(current => ({ ...current, intensity: String(value) }))} style={[s.effortStep, form.intensity === String(value) && { backgroundColor: C.orange }]}><Text style={[s.chipText, form.intensity === String(value) && { color: C.bg }]}>{value}</Text></Pressable>)}</View><View style={s.row}><Text style={s.small}>Très facile</Text><Text style={s.small}>Maximal</Text></View></>}
           {sheet === 'recovery' && <><Text style={s.body}>Un bilan personnel, sans capteur ni score médical.</Text><Field label="Sommeil (heures)" numeric value={form.sleep ?? ''} onChange={sleep => setForm(current => ({ ...current, sleep }))} /><Text style={s.fieldLabel}>Votre énergie · {form.energy}/5</Text><View style={s.energyRow}>{['À plat', 'Basse', 'Correcte', 'Bonne', 'Au top'].map((label, index) => <Pressable key={label} accessibilityRole="button" accessibilityLabel={`Énergie ${index + 1} sur 5, ${label}`} accessibilityState={{ selected: form.energy === String(index + 1) }} onPress={() => setForm(current => ({ ...current, energy: String(index + 1) }))} style={[s.energyStep, form.energy === String(index + 1) && s.selectedChip]}><Text style={[s.energyNumber, form.energy === String(index + 1) && { color: C.green }]}>{index + 1}</Text><Text style={s.energyLabel}>{label}</Text></Pressable>)}</View></>}
           {sheet === 'goals' && <><Text style={s.body}>Des repères que vous choisissez. Les valeurs proposées ne sont pas des recommandations personnalisées.</Text>{[{ key: 'calories', label: 'Énergie quotidienne (kcal)' }, { key: 'protein', label: 'Protéines quotidiennes (g)' }, { key: 'water', label: 'Eau quotidienne (ml)' }, { key: 'sleep', label: 'Sommeil (heures)' }].map(field => <Field key={field.key} label={field.label} numeric value={form[field.key] ?? ''} onChange={value => setForm(current => ({ ...current, [field.key]: value }))} />)}<View style={s.note}><Icon name="lock-closed-outline" color={C.blue} /><Text style={[s.body, s.flex]}>Le journal est enregistré sur cet appareil, sans compte ni synchronisation. Aucune connexion à WHOOP ou à une montre pour le moment.</Text></View><Button secondary title="Effacer le journal" icon="trash-outline" onPress={() => open('clear')} /></>}
           {sheet === 'clear' && <Text style={s.body}>Tous les repas, activités et bilans enregistrés sur cet appareil seront effacés, y compris les exemples. Vos objectifs seront conservés. Cette action est définitive.</Text>}
           {!!error && <Text accessibilityRole="alert" style={s.error}>{error}</Text>}
-          <Button title={sheet === 'clear' ? 'Confirmer l’effacement' : 'Enregistrer'} onPress={saveForm} />
+          {sheet !== 'food' && sheet !== 'garmin' && <Button title={sheet === 'clear' ? 'Confirmer l’effacement' : 'Enregistrer'} disabled={photoBusy} onPress={saveForm} />}
         </ScrollView>
       </SafeAreaView></KeyboardAvoidingView>
     </Modal>
@@ -203,6 +283,7 @@ function JournalApp() {
 }
 
 const s = StyleSheet.create({
+  mealPhoto: { width: '100%', height: 200, borderRadius: 18, backgroundColor: C.card },
   screen: { flex: 1, backgroundColor: C.bg }, container: { flex: 1, width: '100%', maxWidth: 680, alignSelf: 'center' }, loading: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 16 },
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 22, paddingVertical: 16 }, brand: { flexDirection: 'row', alignItems: 'center', gap: 10 }, brandMark: { width: 34, height: 34, backgroundColor: C.green, borderRadius: 10, alignItems: 'center', justifyContent: 'center' }, brandName: { color: C.text, fontSize: 25, fontWeight: '800', letterSpacing: -1 }, iconButton: { width: 42, height: 42, alignItems: 'center', justifyContent: 'center', borderRadius: 14, backgroundColor: C.card },
   content: { paddingHorizontal: 22, paddingBottom: 24, gap: 16 }, dateRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 8 }, dateArrow: { padding: 5 }, dateText: { color: C.muted, fontSize: 10, fontWeight: '700', letterSpacing: 0.6, textAlign: 'center' }, pageTitle: { color: C.text, fontSize: 33, fontWeight: '800', letterSpacing: -1.1, marginTop: 4 }, subtitle: { color: C.muted, fontSize: 14, lineHeight: 22, marginTop: -10 },

@@ -2,7 +2,7 @@
   "expo": {
     "name": "Profilage",
     "slug": "profilage",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
@@ -19,6 +19,24 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Profilage utilise la cam\u00e9ra pour lire les codes-barres alimentaires.",
+          "recordAudioAndroid": false,
+          "microphonePermission": false
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Profilage acc\u00e8de aux photos que vous choisissez pour votre journal de repas.",
+          "cameraPermission": "Profilage utilise la cam\u00e9ra pour photographier vos repas.",
+          "microphonePermission": false
+        }
+      ]
+    ]
   }
 }

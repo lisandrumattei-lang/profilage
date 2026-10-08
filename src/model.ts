@@ -1,5 +1,5 @@
-export type Meal = { id: string; name: string; calories: number; protein: number; carbs: number; fat: number };
-export type Workout = { id: string; name: string; minutes: number; intensity: number };
+export type Meal = { id: string; name: string; calories: number; protein: number; carbs: number; fat: number; photoUri?: string; barcode?: string; ciqualCode?: string; portion?: number; foodSource?: 'openfoodfacts' | 'ciqual' };
+export type Workout = { id: string; name: string; minutes: number; intensity: number; source?: 'garmin-tcx'; distanceKm?: number };
 export type Day = { meals: Meal[]; workouts: Workout[]; water: number; sleep: number; energy: number };
 export type Goals = { calories: number; protein: number; water: number; sleep: number };
 export type Journal = { version: 1; days: Record<string, Day>; goals: Goals; demo: boolean };
@@ -43,7 +43,9 @@ export function reduceJournal(state: Journal, action: Action): Journal {
   const day = { ...(state.days[action.date] ?? emptyDay()) };
   switch (action.type) {
     case 'meal': day.meals = [...day.meals, action.meal]; break;
-    case 'workout': day.workouts = [...day.workouts, action.workout]; break;
+    case 'workout':
+      if (day.workouts.some(workout => workout.id === action.workout.id)) return state;
+      day.workouts = [...day.workouts, action.workout]; break;
     case 'removeMeal': day.meals = day.meals.filter(meal => meal.id !== action.id); break;
     case 'removeWorkout': day.workouts = day.workouts.filter(workout => workout.id !== action.id); break;
     case 'water': day.water = Math.max(0, Math.min(10000, day.water + action.delta)); break;
@@ -62,10 +64,17 @@ export function parseJournal(raw: string): Journal {
   for (const [date, day] of Object.entries(data.days)) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !object(day) || !finite(day.water, 0, 10000) || !finite(day.sleep, 0, 24) || !finite(day.energy, 0, 5) || !Number.isInteger(day.energy) || !Array.isArray(day.meals) || !Array.isArray(day.workouts)) throw new Error('Journée invalide');
     for (const meal of day.meals) {
-      if (!object(meal) || !text(meal.id) || !text(meal.name) || !finite(meal.calories, 1, 10000) || !finite(meal.protein, 0, 1000) || !finite(meal.carbs, 0, 1000) || !finite(meal.fat, 0, 1000)) throw new Error('Repas invalide');
+      if (!object(meal) || !text(meal.id) || !text(meal.name) || !finite(meal.calories, 0, 10000) || !finite(meal.protein, 0, 1000) || !finite(meal.carbs, 0, 1000) || !finite(meal.fat, 0, 1000)) throw new Error('Repas invalide');
+      if (meal.photoUri !== undefined && (typeof meal.photoUri !== 'string' || meal.photoUri.length > 1500000 || !/^(file:|content:|data:image\/jpeg;base64,)/.test(meal.photoUri))) throw new Error('Photo invalide');
+      if (meal.barcode !== undefined && (typeof meal.barcode !== 'string' || !/^\d{8,14}$/.test(meal.barcode))) throw new Error('Code-barres invalide');
+      if (meal.portion !== undefined && !finite(meal.portion, 1, 5000)) throw new Error('Portion invalide');
+      if (meal.foodSource !== undefined && meal.foodSource !== 'openfoodfacts' && meal.foodSource !== 'ciqual') throw new Error('Source alimentaire invalide');
+      if (meal.ciqualCode !== undefined && (typeof meal.ciqualCode !== 'string' || !/^\d{1,8}$/.test(meal.ciqualCode))) throw new Error('Code Ciqual invalide');
     }
     for (const workout of day.workouts) {
       if (!object(workout) || !text(workout.id) || !text(workout.name) || !finite(workout.minutes, 1, 600) || !finite(workout.intensity, 1, 10)) throw new Error('Activité invalide');
+      if (workout.source !== undefined && workout.source !== 'garmin-tcx') throw new Error('Source d’activité invalide');
+      if (workout.distanceKm !== undefined && !finite(workout.distanceKm, 0, 1000)) throw new Error('Distance invalide');
     }
   }
   return data as Journal;
